@@ -17,6 +17,13 @@ export function normalizePrismLanguage(raw: string): string {
     md: "markdown",
     text: "plaintext",
     txt: "plaintext",
+    /** Slim Prism bundle: approximate for highlighting */
+    docker: "javascript",
+    dockerfile: "javascript",
+    csharp: "javascript",
+    cs: "javascript",
+    kt: "kotlin",
+    kts: "kotlin",
   };
   const resolved = aliases[x] ?? x;
   const supported = new Set([
@@ -36,7 +43,6 @@ export function normalizePrismLanguage(raw: string): string {
     "java",
     "kotlin",
     "swift",
-    "csharp",
     "cpp",
     "c",
     "sql",
@@ -44,7 +50,6 @@ export function normalizePrismLanguage(raw: string): string {
     "plaintext",
     "diff",
     "yaml",
-    "docker",
     "ruby",
   ]);
   if (supported.has(resolved)) return resolved;

@@ -1,5 +1,5 @@
 import * as Clipboard from "expo-clipboard";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -8,7 +8,6 @@ import {
   Pressable,
   RefreshControl,
   ScrollView,
-  Switch,
   Text,
   TextInput,
   useWindowDimensions,
@@ -19,7 +18,9 @@ import { CodeBlock } from "../components/CodeBlock";
 import { NoteBodyDisplay } from "../components/NoteBodyDisplay";
 import { NoteMarkdown } from "../components/NoteMarkdown";
 import { useAuth } from "../context/AuthContext";
+import { applyPasteAsCode } from "../lib/applyPasteAsCode";
 import { formatNoteDate, noteSnapshot } from "../lib/noteSnapshot";
+import { inferFenceLanguageFromBody, wrapBodyWithLanguage } from "../lib/wrapBodyWithLanguage";
 import { supabase } from "../lib/supabase";
 import type { Note } from "../types/note";
 
@@ -46,11 +47,44 @@ export function NotesScreen() {
 
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
-  const [isCodeSnippet, setIsCodeSnippet] = useState(false);
   const [codeLanguage, setCodeLanguage] = useState("typescript");
   const [composeTab, setComposeTab] = useState<ComposeTab>("edit");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const bodyInputRef = useRef<TextInput>(null);
+  const bodyForPasteRef = useRef(body);
+  const isCodeSnippetForPasteRef = useRef(false);
+
+  const composeSnippetMode = useMemo(() => {
+    if (!editingNoteId) return false;
+    return notes.find((n) => n.id === editingNoteId)?.is_code_snippet === true;
+  }, [editingNoteId, notes]);
+
+  /** Before paint — avoids paste handling with a stale body vs DOM selection (useEffect runs too late). */
+  useLayoutEffect(() => {
+    bodyForPasteRef.current = body;
+  }, [body]);
+  useLayoutEffect(() => {
+    isCodeSnippetForPasteRef.current = composeSnippetMode;
+  }, [composeSnippetMode]);
+
+  const restoreWebCursor = useCallback((pos: number) => {
+    if (Platform.OS !== "web" || typeof document === "undefined") return;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const el = document.querySelector(
+          '[data-testid="compose-note-body"]',
+        ) as HTMLTextAreaElement | null;
+        el?.focus();
+        try {
+          el?.setSelectionRange(pos, pos);
+        } catch {
+          /* ignore */
+        }
+      });
+    });
+  }, []);
 
   const selectedNote = useMemo(
     () => (selectedId ? notes.find((n) => n.id === selectedId) ?? null : null),
@@ -94,7 +128,6 @@ export function NotesScreen() {
   const resetComposeFields = () => {
     setTitle("");
     setBody("");
-    setIsCodeSnippet(false);
     setCodeLanguage("typescript");
     setComposeTab("edit");
   };
@@ -141,8 +174,11 @@ export function NotesScreen() {
     setEditingNoteId(selectedNote.id);
     setTitle(selectedNote.title);
     setBody(selectedNote.body);
-    setIsCodeSnippet(selectedNote.is_code_snippet === true);
-    setCodeLanguage(selectedNote.code_language?.trim() || "typescript");
+    setCodeLanguage(
+      selectedNote.is_code_snippet === true
+        ? selectedNote.code_language?.trim() || "typescript"
+        : inferFenceLanguageFromBody(selectedNote.body) ?? "typescript",
+    );
     setComposeTab("edit");
     if (!split) setMobilePanel("detail");
   };
@@ -188,19 +224,46 @@ export function NotesScreen() {
     void load();
   };
 
+  const onLanguagePresetPress = useCallback(
+    (lang: string) => {
+      setCodeLanguage(lang);
+      if (composeSnippetMode) return;
+      const { nextBody, cursor } = wrapBodyWithLanguage(body, lang);
+      setBody(nextBody);
+      restoreWebCursor(cursor);
+    },
+    [body, composeSnippetMode, restoreWebCursor],
+  );
+
   const pasteAsCode = async () => {
-    const text = await Clipboard.getStringAsync();
-    if (!text) return;
-    const lang = codeLanguage.trim() || "text";
-    if (isCodeSnippet) {
-      setBody((b) => (b.trim() ? `${b.trimEnd()}\n${text}` : text));
-    } else {
-      setBody((b) => {
-        const fence = `\`\`\`${lang}\n${text.trimEnd()}\n\`\`\`\n`;
-        return b.trim() ? `${b.trimEnd()}\n\n${fence}` : fence;
-      });
+    setError(null);
+    let text = "";
+    try {
+      text = await Clipboard.getStringAsync();
+    } catch {
+      if (Platform.OS === "web" && typeof navigator !== "undefined" && navigator.clipboard?.readText) {
+        try {
+          text = await navigator.clipboard.readText();
+        } catch {
+          setError("Could not read the clipboard. Allow paste permission or use Cmd/Ctrl+V in the body field.");
+          return;
+        }
+      } else {
+        setError("Could not read the clipboard.");
+        return;
+      }
     }
+    if (!text) return;
+    const { nextBody, cursor, detected } = applyPasteAsCode({
+      body,
+      pasted: text,
+      isCodeSnippet: composeSnippetMode,
+      range: null,
+    });
+    setCodeLanguage(detected);
+    setBody(nextBody);
     setComposeTab("edit");
+    restoreWebCursor(cursor);
   };
 
   const onSave = async () => {
@@ -208,11 +271,14 @@ export function NotesScreen() {
     setSaving(true);
     setError(null);
     const lang = codeLanguage.trim() || "text";
+    const saveAsSnippet =
+      editingNoteId !== null &&
+      notes.find((n) => n.id === editingNoteId)?.is_code_snippet === true;
     const row = {
-      title: title.trim() || (isCodeSnippet ? "Code snippet" : "Untitled"),
+      title: title.trim() || (saveAsSnippet ? "Code snippet" : "Untitled"),
       body: body.trim(),
-      is_code_snippet: isCodeSnippet,
-      code_language: isCodeSnippet ? lang : "",
+      is_code_snippet: saveAsSnippet,
+      code_language: saveAsSnippet ? lang : "",
       updated_at: new Date().toISOString(),
     };
 
@@ -246,16 +312,97 @@ export function NotesScreen() {
       setError(insertError.message);
       return;
     }
-    resetComposeFields();
-    setComposing(false);
-    if (data?.id) {
-      setSelectedId(data.id as string);
-      if (!split) setMobilePanel("detail");
+    if (!data) {
+      setError("Note saved but no data returned from server.");
+      void load();
+      return;
     }
+    const newNote = data as Note;
+    setNotes((prev) => {
+      const rest = prev.filter((n) => n.id !== newNote.id);
+      return [newNote, ...rest];
+    });
+    resetComposeFields();
+    setEditingNoteId(null);
+    setComposing(false);
+    setSelectedId(newNote.id);
+    if (!split) setMobilePanel("detail");
     void load();
   };
 
   const isComposeOpen = composing || editingNoteId !== null;
+
+  /** react-native-web drops `onPaste`; bind the DOM `paste` event on the textarea. */
+  useLayoutEffect(() => {
+    if (Platform.OS !== "web" || composeTab !== "edit" || !isComposeOpen) return;
+
+    const resolveTextarea = (): HTMLTextAreaElement | null => {
+      const fromRef = bodyInputRef.current as unknown as HTMLTextAreaElement | null;
+      if (fromRef && typeof fromRef.addEventListener === "function") return fromRef;
+      if (typeof document !== "undefined") {
+        return document.querySelector(
+          '[data-testid="compose-note-body"]',
+        ) as HTMLTextAreaElement | null;
+      }
+      return null;
+    };
+
+    let cancelled = false;
+    let attachedTo: HTMLTextAreaElement | null = null;
+    let rafId: number | null = null;
+    let attempts = 0;
+    const maxAttempts = 90;
+
+    const onPasteDom = (e: Event) => {
+      const ce = e as ClipboardEvent;
+      const pasted = ce.clipboardData?.getData("text/plain") ?? "";
+      if (!pasted) return;
+      ce.preventDefault();
+      ce.stopPropagation();
+      const target = ce.target as HTMLTextAreaElement;
+      /** Must match `selectionStart` / `selectionEnd` (controlled input can lag React state). */
+      const b = typeof target.value === "string" ? target.value : bodyForPasteRef.current;
+      const snippet = isCodeSnippetForPasteRef.current;
+      const len = b.length;
+      let start = typeof target.selectionStart === "number" ? target.selectionStart : len;
+      let end = typeof target.selectionEnd === "number" ? target.selectionEnd : start;
+      start = Math.max(0, Math.min(start, len));
+      end = Math.max(start, Math.min(end, len));
+      const { nextBody, cursor, detected } = applyPasteAsCode({
+        body: b,
+        pasted,
+        isCodeSnippet: snippet,
+        range: { start, end },
+      });
+      bodyForPasteRef.current = nextBody;
+      setCodeLanguage(detected);
+      setBody(nextBody);
+      setComposeTab("edit");
+      restoreWebCursor(cursor);
+    };
+
+    const tryAttach = () => {
+      if (cancelled) return;
+      const textarea = resolveTextarea();
+      if (textarea) {
+        attachedTo = textarea;
+        textarea.addEventListener("paste", onPasteDom, true);
+        return;
+      }
+      attempts += 1;
+      if (attempts < maxAttempts) {
+        rafId = requestAnimationFrame(tryAttach);
+      }
+    };
+
+    tryAttach();
+
+    return () => {
+      cancelled = true;
+      if (rafId != null) cancelAnimationFrame(rafId);
+      attachedTo?.removeEventListener("paste", onPasteDom, true);
+    };
+  }, [composeTab, isComposeOpen, restoreWebCursor]);
 
   const composeForm = (
     <ScrollView className="flex-1 px-4" keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
@@ -270,28 +417,9 @@ export function NotesScreen() {
         onChangeText={setTitle}
       />
 
-      <View className="mb-3 flex-row items-center justify-between rounded-lg border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-700 dark:bg-neutral-900">
-        <View className="flex-1 pr-2">
-          <Text className="text-sm font-medium text-neutral-900 dark:text-neutral-100">Save as code snippet</Text>
-          <Text className="text-xs text-neutral-500 dark:text-neutral-400">
-            Raw code with a language label (syntax highlighting).
-          </Text>
-        </View>
-        <Switch value={isCodeSnippet} onValueChange={setIsCodeSnippet} />
-      </View>
-
       <Text className="mb-1 text-xs font-medium uppercase tracking-wide text-neutral-500">
-        Language (fenced blocks & code notes)
+        {composeSnippetMode ? "Language (syntax highlight)" : "Language — wraps body in a code block"}
       </Text>
-      <TextInput
-        className="mb-2 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-neutral-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
-        placeholder="e.g. typescript"
-        placeholderTextColor="#a3a3a3"
-        autoCapitalize="none"
-        autoCorrect={false}
-        value={codeLanguage}
-        onChangeText={setCodeLanguage}
-      />
       <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mb-3 flex-row">
         {LANG_PRESETS.map((l) => (
           <Pressable
@@ -301,7 +429,7 @@ export function NotesScreen() {
                 ? "border-neutral-900 bg-neutral-900 dark:border-neutral-100 dark:bg-neutral-100"
                 : "border-neutral-300 bg-neutral-50 dark:border-neutral-600 dark:bg-neutral-800"
             }`}
-            onPress={() => setCodeLanguage(l)}
+            onPress={() => onLanguagePresetPress(l)}
           >
             <Text
               className={`text-xs font-medium ${
@@ -357,11 +485,13 @@ export function NotesScreen() {
 
       {composeTab === "edit" ? (
         <TextInput
+          ref={bodyInputRef}
+          testID="compose-note-body"
           className="mb-2 min-h-[160px] rounded-lg border border-neutral-200 bg-white px-3 py-2 text-neutral-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
           placeholder={
-            isCodeSnippet
-              ? "Paste or type code…"
-              : "Markdown: **bold**, `inline code`, lists, and ``` fenced blocks"
+            composeSnippetMode
+              ? "Paste or type code… (Web: Cmd/Ctrl+V = paste as code)"
+              : "Markdown… (Web: Cmd/Ctrl+V in this field pastes as a code block)"
           }
           placeholderTextColor="#a3a3a3"
           multiline
@@ -369,7 +499,7 @@ export function NotesScreen() {
           value={body}
           onChangeText={setBody}
         />
-      ) : isCodeSnippet ? (
+      ) : composeSnippetMode ? (
         <View className="mb-2 min-h-[160px]">
           {body.trim() ? (
             <CodeBlock code={body} language={codeLanguage} maxHeight={320} />
@@ -392,7 +522,12 @@ export function NotesScreen() {
           className="rounded-lg border border-neutral-300 bg-white px-4 py-2.5 active:bg-neutral-100 dark:border-neutral-600 dark:bg-neutral-900 dark:active:bg-neutral-800"
           onPress={() => void pasteAsCode()}
         >
-          <Text className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Paste as code</Text>
+          <View className="items-center">
+            <Text className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Paste as code</Text>
+            <Text className="mt-0.5 text-center text-[10px] text-neutral-500 dark:text-neutral-400">
+              Web: Cmd/Ctrl+V in body too
+            </Text>
+          </View>
         </Pressable>
       </View>
 
