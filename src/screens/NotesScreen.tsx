@@ -13,15 +13,32 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
+import {
+  CaretLeft,
+  CaretRight,
+  Check,
+  ClipboardText,
+  Eye,
+  NotePencil,
+  Notepad,
+  PencilSimple,
+  Plus,
+  SignOut,
+  Trash,
+  X,
+} from "phosphor-react-native";
 
 import { CodeBlock } from "../components/CodeBlock";
+import { UnsavedChangesModal } from "../components/UnsavedChangesModal";
 import { NoteBodyDisplay } from "../components/NoteBodyDisplay";
 import { NoteMarkdown } from "../components/NoteMarkdown";
 import { useAuth } from "../context/AuthContext";
 import { applyPasteAsCode } from "../lib/applyPasteAsCode";
 import { formatNoteDate, noteSnapshot } from "../lib/noteSnapshot";
+import { heuristicTitleFromPaste, summarizePasteForTitle } from "../lib/summarizePasteForTitle";
 import { inferFenceLanguageFromBody, wrapBodyWithLanguage } from "../lib/wrapBodyWithLanguage";
 import { supabase } from "../lib/supabase";
+import { useIconSemantic } from "../theme/iconColors";
 import type { Note } from "../types/note";
 
 const LANG_PRESETS = ["typescript", "tsx", "javascript", "python", "bash", "rust", "go", "text"] as const;
@@ -31,6 +48,17 @@ type ComposeTab = "edit" | "preview";
 const SPLIT_MIN_WIDTH = 720;
 
 type MobilePanel = "list" | "detail";
+
+type PendingNav =
+  | { kind: "newNote" }
+  | { kind: "openNote"; id: string }
+  | { kind: "goBackList" }
+  | { kind: "cancelCompose"; wasNew: boolean; hadSelectedId: boolean };
+
+type PersistResult =
+  | { ok: true; kind: "update"; noteId: string }
+  | { ok: true; kind: "insert"; note: Note }
+  | { ok: false };
 
 export function NotesScreen() {
   const { user, signOut } = useAuth();
@@ -51,8 +79,15 @@ export function NotesScreen() {
   const [composeTab, setComposeTab] = useState<ComposeTab>("edit");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [titleSummarizing, setTitleSummarizing] = useState(false);
+  const [unsavedModalVisible, setUnsavedModalVisible] = useState(false);
+
+  const icon = useIconSemantic();
 
   const bodyInputRef = useRef<TextInput>(null);
+  const titleFromPasteSeqRef = useRef(0);
+  const composeSnapshotRef = useRef<{ title: string; body: string; codeLanguage: string } | null>(null);
+  const pendingNavRef = useRef<PendingNav | null>(null);
   const bodyForPasteRef = useRef(body);
   const isCodeSnippetForPasteRef = useRef(false);
 
@@ -125,60 +160,229 @@ export function NotesScreen() {
     void load();
   };
 
-  const resetComposeFields = () => {
+  const resetComposeFields = useCallback(() => {
+    titleFromPasteSeqRef.current += 1;
+    setTitleSummarizing(false);
     setTitle("");
     setBody("");
     setCodeLanguage("typescript");
     setComposeTab("edit");
-  };
+    composeSnapshotRef.current = null;
+  }, []);
 
-  const openNewNote = () => {
-    setSelectedId(null);
+  const isComposeOpen = composing || editingNoteId !== null;
+
+  const isComposeDirty = useMemo(() => {
+    if (!isComposeOpen) return false;
+    const s = composeSnapshotRef.current;
+    if (!s) return false;
+    return (
+      title.trim() !== s.title.trim() ||
+      body !== s.body ||
+      codeLanguage !== s.codeLanguage
+    );
+  }, [isComposeOpen, title, body, codeLanguage]);
+
+  const flushComposeAndRunPending = useCallback(() => {
+    const p = pendingNavRef.current;
+    pendingNavRef.current = null;
+    setUnsavedModalVisible(false);
+    resetComposeFields();
+    setEditingNoteId(null);
+    setComposing(false);
+    if (!p) return;
+    switch (p.kind) {
+      case "newNote":
+        setSelectedId(null);
+        setComposing(true);
+        composeSnapshotRef.current = { title: "", body: "", codeLanguage: "typescript" };
+        if (!split) setMobilePanel("detail");
+        break;
+      case "openNote":
+        setSelectedId(p.id);
+        if (!split) setMobilePanel("detail");
+        break;
+      case "goBackList":
+        setMobilePanel("list");
+        break;
+      case "cancelCompose":
+        if (!split) {
+          if (p.wasNew || !p.hadSelectedId) setMobilePanel("list");
+          else setMobilePanel("detail");
+        }
+        break;
+    }
+  }, [resetComposeFields, split]);
+
+  const handleUnsavedKeepEditing = useCallback(() => {
+    pendingNavRef.current = null;
+    setUnsavedModalVisible(false);
+  }, []);
+
+  const handleUnsavedDiscard = useCallback(() => {
+    flushComposeAndRunPending();
+  }, [flushComposeAndRunPending]);
+
+  const persistCompose = useCallback(async (): Promise<PersistResult> => {
+    if (!user) return { ok: false };
+    setSaving(true);
+    setError(null);
+    const lang = codeLanguage.trim() || "text";
+    const saveAsSnippet =
+      editingNoteId !== null &&
+      notes.find((n) => n.id === editingNoteId)?.is_code_snippet === true;
+    const row = {
+      title: title.trim() || (saveAsSnippet ? "Code snippet" : "Untitled"),
+      body: body.trim(),
+      is_code_snippet: saveAsSnippet,
+      code_language: saveAsSnippet ? lang : "",
+      updated_at: new Date().toISOString(),
+    };
+
+    if (editingNoteId) {
+      const id = editingNoteId;
+      const { error: updateError } = await supabase.from("notes").update(row).eq("id", id);
+      setSaving(false);
+      if (updateError) {
+        setError(updateError.message);
+        return { ok: false };
+      }
+      void load();
+      return { ok: true, kind: "update", noteId: id };
+    }
+
+    const { data, error: insertError } = await supabase
+      .from("notes")
+      .insert({ user_id: user.id, ...row })
+      .select()
+      .single();
+
+    setSaving(false);
+    if (insertError) {
+      setError(insertError.message);
+      return { ok: false };
+    }
+    if (!data) {
+      setError("Note saved but no data returned from server.");
+      void load();
+      return { ok: false };
+    }
+    const newNote = data as Note;
+    setNotes((prev) => {
+      const rest = prev.filter((n) => n.id !== newNote.id);
+      return [newNote, ...rest];
+    });
+    void load();
+    return { ok: true, kind: "insert", note: newNote };
+  }, [user, codeLanguage, editingNoteId, notes, title, body, load]);
+
+  const handleUnsavedSave = useCallback(async () => {
+    const r = await persistCompose();
+    if (!r.ok) return;
+    flushComposeAndRunPending();
+  }, [persistCompose, flushComposeAndRunPending]);
+
+  const onSave = useCallback(async () => {
+    const r = await persistCompose();
+    if (!r.ok) return;
     setEditingNoteId(null);
     resetComposeFields();
-    setComposing(true);
+    setComposing(false);
+    if (r.kind === "update") {
+      setSelectedId(r.noteId);
+    } else {
+      setSelectedId(r.note.id);
+    }
     if (!split) setMobilePanel("detail");
+  }, [persistCompose, resetComposeFields, split]);
+
+  const openNewNote = () => {
+    const run = () => {
+      setSelectedId(null);
+      setEditingNoteId(null);
+      resetComposeFields();
+      setComposing(true);
+      composeSnapshotRef.current = { title: "", body: "", codeLanguage: "typescript" };
+      if (!split) setMobilePanel("detail");
+    };
+    if (isComposeOpen && isComposeDirty) {
+      pendingNavRef.current = { kind: "newNote" };
+      setUnsavedModalVisible(true);
+      return;
+    }
+    run();
   };
 
   const openNote = (id: string) => {
-    setSelectedId(id);
-    setComposing(false);
-    setEditingNoteId(null);
-    if (!split) setMobilePanel("detail");
+    const run = () => {
+      setSelectedId(id);
+      setComposing(false);
+      setEditingNoteId(null);
+      resetComposeFields();
+      if (!split) setMobilePanel("detail");
+    };
+    if (isComposeOpen && isComposeDirty) {
+      pendingNavRef.current = { kind: "openNote", id };
+      setUnsavedModalVisible(true);
+      return;
+    }
+    run();
   };
 
   const goBackToList = () => {
-    setEditingNoteId(null);
-    setComposing(false);
-    resetComposeFields();
-    setMobilePanel("list");
+    const run = () => {
+      setEditingNoteId(null);
+      setComposing(false);
+      resetComposeFields();
+      setMobilePanel("list");
+    };
+    if (isComposeOpen && isComposeDirty) {
+      pendingNavRef.current = { kind: "goBackList" };
+      setUnsavedModalVisible(true);
+      return;
+    }
+    run();
   };
 
   const cancelCompose = () => {
     const wasNew = composing;
-    setComposing(false);
-    setEditingNoteId(null);
-    resetComposeFields();
-    if (!split) {
-      if (wasNew || !selectedId) {
-        setMobilePanel("list");
-      } else {
-        setMobilePanel("detail");
+    const hadSelectedId = selectedId !== null;
+    const run = () => {
+      setComposing(false);
+      setEditingNoteId(null);
+      resetComposeFields();
+      if (!split) {
+        if (wasNew || !selectedId) {
+          setMobilePanel("list");
+        } else {
+          setMobilePanel("detail");
+        }
       }
+    };
+    if (isComposeDirty) {
+      pendingNavRef.current = { kind: "cancelCompose", wasNew, hadSelectedId };
+      setUnsavedModalVisible(true);
+      return;
     }
+    run();
   };
 
   const startEditSelected = () => {
     if (!selectedNote) return;
+    const codeLang =
+      selectedNote.is_code_snippet === true
+        ? selectedNote.code_language?.trim() || "typescript"
+        : inferFenceLanguageFromBody(selectedNote.body) ?? "typescript";
+    composeSnapshotRef.current = {
+      title: selectedNote.title ?? "",
+      body: selectedNote.body ?? "",
+      codeLanguage: codeLang,
+    };
     setComposing(false);
     setEditingNoteId(selectedNote.id);
     setTitle(selectedNote.title);
     setBody(selectedNote.body);
-    setCodeLanguage(
-      selectedNote.is_code_snippet === true
-        ? selectedNote.code_language?.trim() || "typescript"
-        : inferFenceLanguageFromBody(selectedNote.body) ?? "typescript",
-    );
+    setCodeLanguage(codeLang);
     setComposeTab("edit");
     if (!split) setMobilePanel("detail");
   };
@@ -224,6 +428,25 @@ export function NotesScreen() {
     void load();
   };
 
+  const scheduleTitleFromPaste = useCallback((pasted: string) => {
+    const seq = ++titleFromPasteSeqRef.current;
+    setTitleSummarizing(true);
+    void summarizePasteForTitle(pasted)
+      .then((next) => {
+        if (seq !== titleFromPasteSeqRef.current) return;
+        setTitleSummarizing(false);
+        if (!next) return;
+        setTitle((prev) => (prev.trim() === "" ? next : prev));
+      })
+      .catch(() => {
+        if (seq !== titleFromPasteSeqRef.current) return;
+        setTitleSummarizing(false);
+        const fallback = heuristicTitleFromPaste(pasted);
+        if (!fallback) return;
+        setTitle((prev) => (prev.trim() === "" ? fallback : prev));
+      });
+  }, []);
+
   const onLanguagePresetPress = useCallback(
     (lang: string) => {
       setCodeLanguage(lang);
@@ -264,73 +487,8 @@ export function NotesScreen() {
     setBody(nextBody);
     setComposeTab("edit");
     restoreWebCursor(cursor);
+    scheduleTitleFromPaste(text);
   };
-
-  const onSave = async () => {
-    if (!user || saving) return;
-    setSaving(true);
-    setError(null);
-    const lang = codeLanguage.trim() || "text";
-    const saveAsSnippet =
-      editingNoteId !== null &&
-      notes.find((n) => n.id === editingNoteId)?.is_code_snippet === true;
-    const row = {
-      title: title.trim() || (saveAsSnippet ? "Code snippet" : "Untitled"),
-      body: body.trim(),
-      is_code_snippet: saveAsSnippet,
-      code_language: saveAsSnippet ? lang : "",
-      updated_at: new Date().toISOString(),
-    };
-
-    if (editingNoteId) {
-      const { error: updateError } = await supabase.from("notes").update(row).eq("id", editingNoteId);
-      setSaving(false);
-      if (updateError) {
-        setError(updateError.message);
-        return;
-      }
-      setEditingNoteId(null);
-      resetComposeFields();
-      setSelectedId(editingNoteId);
-      setComposing(false);
-      if (!split) setMobilePanel("detail");
-      void load();
-      return;
-    }
-
-    const { data, error: insertError } = await supabase
-      .from("notes")
-      .insert({
-        user_id: user.id,
-        ...row,
-      })
-      .select()
-      .single();
-
-    setSaving(false);
-    if (insertError) {
-      setError(insertError.message);
-      return;
-    }
-    if (!data) {
-      setError("Note saved but no data returned from server.");
-      void load();
-      return;
-    }
-    const newNote = data as Note;
-    setNotes((prev) => {
-      const rest = prev.filter((n) => n.id !== newNote.id);
-      return [newNote, ...rest];
-    });
-    resetComposeFields();
-    setEditingNoteId(null);
-    setComposing(false);
-    setSelectedId(newNote.id);
-    if (!split) setMobilePanel("detail");
-    void load();
-  };
-
-  const isComposeOpen = composing || editingNoteId !== null;
 
   /** react-native-web drops `onPaste`; bind the DOM `paste` event on the textarea. */
   useLayoutEffect(() => {
@@ -379,6 +537,7 @@ export function NotesScreen() {
       setBody(nextBody);
       setComposeTab("edit");
       restoreWebCursor(cursor);
+      scheduleTitleFromPaste(pasted);
     };
 
     const tryAttach = () => {
@@ -402,20 +561,28 @@ export function NotesScreen() {
       if (rafId != null) cancelAnimationFrame(rafId);
       attachedTo?.removeEventListener("paste", onPasteDom, true);
     };
-  }, [composeTab, isComposeOpen, restoreWebCursor]);
+  }, [composeTab, isComposeOpen, restoreWebCursor, scheduleTitleFromPaste]);
 
   const composeForm = (
     <ScrollView className="flex-1 px-4" keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag">
       <Text className="mb-2 text-xs font-medium uppercase tracking-wide text-neutral-500">
         {editingNoteId ? "Edit note" : "New note"}
       </Text>
-      <TextInput
-        className="mb-3 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-neutral-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
-        placeholder="Title"
-        placeholderTextColor="#a3a3a3"
-        value={title}
-        onChangeText={setTitle}
-      />
+      <View className="mb-3">
+        <TextInput
+          className="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-neutral-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+          placeholder="Title (filled from pasted content when empty)"
+          placeholderTextColor="#a3a3a3"
+          value={title}
+          onChangeText={setTitle}
+        />
+        {titleSummarizing ? (
+          <View className="mt-1.5 flex-row items-center gap-2">
+            <ActivityIndicator size="small" color="#737373" />
+            <Text className="text-xs text-neutral-500 dark:text-neutral-400">Generating title…</Text>
+          </View>
+        ) : null}
+      </View>
 
       <Text className="mb-1 text-xs font-medium uppercase tracking-wide text-neutral-500">
         {composeSnippetMode ? "Language (syntax highlight)" : "Language — wraps body in a code block"}
@@ -446,13 +613,18 @@ export function NotesScreen() {
 
       <View className="mb-2 flex-row gap-2">
         <Pressable
-          className={`flex-1 items-center rounded-lg border py-2 ${
+          className={`flex-1 flex-row items-center justify-center gap-2 rounded-lg border py-2 ${
             composeTab === "edit"
               ? "border-neutral-900 bg-neutral-900 dark:border-neutral-100 dark:bg-neutral-100"
               : "border-neutral-300 dark:border-neutral-600"
           }`}
           onPress={() => setComposeTab("edit")}
         >
+          <PencilSimple
+            size={18}
+            weight="bold"
+            color={composeTab === "edit" ? icon.onInverse : icon.fgMuted}
+          />
           <Text
             className={`text-sm font-semibold ${
               composeTab === "edit"
@@ -464,13 +636,18 @@ export function NotesScreen() {
           </Text>
         </Pressable>
         <Pressable
-          className={`flex-1 items-center rounded-lg border py-2 ${
+          className={`flex-1 flex-row items-center justify-center gap-2 rounded-lg border py-2 ${
             composeTab === "preview"
               ? "border-neutral-900 bg-neutral-900 dark:border-neutral-100 dark:bg-neutral-100"
               : "border-neutral-300 dark:border-neutral-600"
           }`}
           onPress={() => setComposeTab("preview")}
         >
+          <Eye
+            size={18}
+            weight="bold"
+            color={composeTab === "preview" ? icon.onInverse : icon.fgMuted}
+          />
           <Text
             className={`text-sm font-semibold ${
               composeTab === "preview"
@@ -519,12 +696,13 @@ export function NotesScreen() {
 
       <View className="mb-3 flex-row flex-wrap gap-2">
         <Pressable
-          className="rounded-lg border border-neutral-300 bg-white px-4 py-2.5 active:bg-neutral-100 dark:border-neutral-600 dark:bg-neutral-900 dark:active:bg-neutral-800"
+          className="flex-row items-center gap-2 rounded-lg border border-neutral-300 bg-white px-4 py-2.5 active:bg-neutral-100 dark:border-neutral-600 dark:bg-neutral-900 dark:active:bg-neutral-800"
           onPress={() => void pasteAsCode()}
         >
-          <View className="items-center">
+          <ClipboardText size={20} weight="duotone" color={icon.fg} />
+          <View className="flex-1">
             <Text className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Paste as code</Text>
-            <Text className="mt-0.5 text-center text-[10px] text-neutral-500 dark:text-neutral-400">
+            <Text className="mt-0.5 text-[10px] text-neutral-500 dark:text-neutral-400">
               Web: Cmd/Ctrl+V in body too
             </Text>
           </View>
@@ -533,23 +711,27 @@ export function NotesScreen() {
 
       <View className="mb-3 flex-row gap-2">
         <Pressable
-          className="flex-1 items-center rounded-lg border border-neutral-300 py-3 active:bg-neutral-100 dark:border-neutral-600 dark:active:bg-neutral-800"
+          className="flex-1 flex-row items-center justify-center gap-2 rounded-lg border border-neutral-300 py-3 active:bg-neutral-100 dark:border-neutral-600 dark:active:bg-neutral-800"
           onPress={cancelCompose}
           disabled={saving}
         >
+          <X size={20} weight="bold" color={icon.fg} />
           <Text className="font-semibold text-neutral-900 dark:text-neutral-100">Cancel</Text>
         </Pressable>
         <Pressable
-          className="flex-1 items-center rounded-lg bg-neutral-900 py-3 active:opacity-80 dark:bg-neutral-100"
+          className="flex-1 flex-row items-center justify-center gap-2 rounded-lg bg-neutral-900 py-3 active:opacity-80 dark:bg-neutral-100"
           onPress={() => void onSave()}
           disabled={saving}
         >
           {saving ? (
-            <ActivityIndicator color="#fff" />
+            <ActivityIndicator color={icon.onInverse} />
           ) : (
-            <Text className="font-semibold text-white dark:text-neutral-900">
-              {editingNoteId ? "Save changes" : "Save note"}
-            </Text>
+            <>
+              <Check size={20} weight="bold" color={icon.onInverse} />
+              <Text className="font-semibold text-white dark:text-neutral-900">
+                {editingNoteId ? "Save changes" : "Save note"}
+              </Text>
+            </>
           )}
         </Pressable>
       </View>
@@ -562,15 +744,17 @@ export function NotesScreen() {
     <ScrollView className="flex-1 px-4 pb-8 pt-2" keyboardShouldPersistTaps="handled">
       <View className="mb-3 flex-row flex-wrap gap-2">
         <Pressable
-          className="rounded-lg bg-neutral-900 px-4 py-2 active:opacity-80 dark:bg-neutral-100"
+          className="flex-row items-center gap-2 rounded-lg bg-neutral-900 px-4 py-2 active:opacity-80 dark:bg-neutral-100"
           onPress={startEditSelected}
         >
+          <PencilSimple size={18} weight="bold" color={icon.onInverse} />
           <Text className="text-sm font-semibold text-white dark:text-neutral-900">Edit</Text>
         </Pressable>
         <Pressable
-          className="rounded-lg border border-red-300 bg-white px-4 py-2 active:bg-red-50 dark:border-red-800 dark:bg-neutral-900 dark:active:bg-red-950"
+          className="flex-row items-center gap-2 rounded-lg border border-red-300 bg-white px-4 py-2 active:bg-red-50 dark:border-red-800 dark:bg-neutral-900 dark:active:bg-red-950"
           onPress={confirmDeleteSelected}
         >
+          <Trash size={18} weight="bold" color={icon.danger} />
           <Text className="text-sm font-semibold text-red-700 dark:text-red-300">Delete</Text>
         </Pressable>
       </View>
@@ -591,6 +775,9 @@ export function NotesScreen() {
     </ScrollView>
   ) : (
     <View className="flex-1 items-center justify-center px-6">
+      <View className="mb-3">
+        <Notepad size={48} weight="duotone" color={icon.fgSubtle} />
+      </View>
       <Text className="text-center text-base text-neutral-600 dark:text-neutral-400">
         Select a note from the list or create a new one.
       </Text>
@@ -612,11 +799,15 @@ export function NotesScreen() {
     <View className="flex-1 bg-neutral-50 dark:bg-neutral-950">
       <View className="border-b border-neutral-200 px-4 pb-3 pt-14 dark:border-neutral-800">
         <View className="flex-row items-center justify-between">
-          <Text className="text-lg font-semibold text-neutral-900 dark:text-neutral-100">Dev Notes</Text>
+          <View className="flex-row items-center gap-2">
+            <NotePencil size={26} weight="duotone" color={icon.fg} />
+            <Text className="text-lg font-semibold text-neutral-900 dark:text-neutral-100">Dev Notes</Text>
+          </View>
           <Pressable
-            className="rounded-lg bg-neutral-200 px-3 py-1.5 active:opacity-70 dark:bg-neutral-800"
+            className="flex-row items-center gap-1.5 rounded-lg bg-neutral-200 px-3 py-1.5 active:opacity-70 dark:bg-neutral-800"
             onPress={() => void signOut()}
           >
+            <SignOut size={18} weight="bold" color={icon.fg} />
             <Text className="text-sm font-medium text-neutral-900 dark:text-neutral-100">Sign out</Text>
           </Pressable>
         </View>
@@ -640,9 +831,10 @@ export function NotesScreen() {
           >
             <View className="border-b border-neutral-200 px-3 py-2 dark:border-neutral-800">
               <Pressable
-                className="items-center rounded-lg bg-neutral-900 py-2.5 active:opacity-80 dark:bg-neutral-100"
+                className="flex-row items-center justify-center gap-2 rounded-lg bg-neutral-900 py-2.5 active:opacity-80 dark:bg-neutral-100"
                 onPress={openNewNote}
               >
+                <Plus size={20} weight="bold" color={icon.onInverse} />
                 <Text className="text-sm font-semibold text-white dark:text-neutral-900">New note</Text>
               </Pressable>
             </View>
@@ -653,9 +845,14 @@ export function NotesScreen() {
               keyExtractor={(item) => item.id}
               refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
               ListEmptyComponent={
-                <Text className="px-3 py-8 text-center text-sm text-neutral-500 dark:text-neutral-400">
-                  No notes yet. Tap New note.
-                </Text>
+                <View className="items-center px-3 py-10">
+                  <View className="mb-2">
+                    <NotePencil size={40} weight="duotone" color={icon.fgSubtle} />
+                  </View>
+                  <Text className="text-center text-sm text-neutral-500 dark:text-neutral-400">
+                    No notes yet. Tap New note.
+                  </Text>
+                </View>
               }
               renderItem={({ item }) => {
                 const active = item.id === selectedId && !isComposeOpen;
@@ -667,16 +864,19 @@ export function NotesScreen() {
                     }`}
                   >
                     <View className="mb-1 flex-row items-center justify-between gap-2">
-                      <Text className="flex-1 text-sm font-semibold text-neutral-900 dark:text-neutral-100" numberOfLines={1}>
+                      <Text className="min-w-0 flex-1 text-sm font-semibold text-neutral-900 dark:text-neutral-100" numberOfLines={1}>
                         {item.title || "Untitled"}
                       </Text>
-                      {item.is_code_snippet ? (
-                        <View className="rounded bg-amber-200/80 px-1.5 py-0.5 dark:bg-amber-900/60">
-                          <Text className="text-[10px] font-semibold uppercase text-amber-950 dark:text-amber-100">
-                            code
-                          </Text>
-                        </View>
-                      ) : null}
+                      <View className="flex-row items-center gap-1">
+                        {item.is_code_snippet ? (
+                          <View className="rounded bg-amber-200/80 px-1.5 py-0.5 dark:bg-amber-900/60">
+                            <Text className="text-[10px] font-semibold uppercase text-amber-950 dark:text-amber-100">
+                              code
+                            </Text>
+                          </View>
+                        ) : null}
+                        <CaretRight size={16} weight="bold" color={icon.fgSubtle} />
+                      </View>
                     </View>
                     <Text className="text-xs leading-4 text-neutral-600 dark:text-neutral-400" numberOfLines={3}>
                       {noteSnapshot(item)}
@@ -697,9 +897,12 @@ export function NotesScreen() {
               <View className="border-b border-neutral-200 px-2 py-2 dark:border-neutral-800">
                 <Pressable
                   onPress={goBackToList}
-                  className="self-start rounded-lg px-3 py-2 active:bg-neutral-200 dark:active:bg-neutral-800"
+                  accessibilityRole="button"
+                  accessibilityLabel="Back to notes list"
+                  className="flex-row items-center gap-1 self-start rounded-lg px-2 py-2 active:bg-neutral-200 dark:active:bg-neutral-800"
                 >
-                  <Text className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">← Notes</Text>
+                  <CaretLeft size={22} weight="bold" color={icon.fg} />
+                  <Text className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">Notes</Text>
                 </Pressable>
               </View>
             ) : null}
@@ -707,6 +910,20 @@ export function NotesScreen() {
           </View>
         ) : null}
       </View>
+
+      <UnsavedChangesModal
+        visible={unsavedModalVisible}
+        title="Unsaved changes"
+        message={
+          editingNoteId
+            ? "Save your edits before leaving, or discard them."
+            : "Save this note before leaving, or discard the draft."
+        }
+        saving={saving}
+        onKeepEditing={handleUnsavedKeepEditing}
+        onDiscard={handleUnsavedDiscard}
+        onSave={() => void handleUnsavedSave()}
+      />
     </View>
   );
 }

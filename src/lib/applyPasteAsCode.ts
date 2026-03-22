@@ -1,4 +1,5 @@
 import { guessCodeLanguage } from "./guessCodeLanguage";
+import { isPlainProsePaste } from "./isPlainProsePaste";
 
 type Range = { start: number; end: number };
 
@@ -20,11 +21,16 @@ export function applyPasteAsCode(args: {
 }): PasteAsCodeResult {
   const { body, pasted, isCodeSnippet, range } = args;
   const detected = guessCodeLanguage(pasted);
+  const plainMarkdown = !isCodeSnippet && isPlainProsePaste(pasted);
 
   if (!range) {
     if (isCodeSnippet) {
       const nextBody = body.trim() ? `${body.trimEnd()}\n${pasted}` : pasted;
       return { nextBody, cursor: nextBody.length, detected };
+    }
+    if (plainMarkdown) {
+      const nextBody = body.trim() ? `${body.trimEnd()}\n${pasted}` : pasted;
+      return { nextBody, cursor: nextBody.length, detected: "text" };
     }
     const fence = `\`\`\`${detected}\n${pasted.trimEnd()}\n\`\`\`\n`;
     const nextBody = body.trim() ? `${body.trimEnd()}\n\n${fence}` : fence;
@@ -40,6 +46,13 @@ export function applyPasteAsCode(args: {
     const insertion = join + pasted;
     const nextBody = before + insertion + after;
     return { nextBody, cursor: before.length + insertion.length, detected };
+  }
+
+  if (plainMarkdown) {
+    const join = before.length > 0 && !before.endsWith("\n") ? "\n" : "";
+    const insertion = join + pasted;
+    const nextBody = before + insertion + after;
+    return { nextBody, cursor: before.length + insertion.length, detected: "text" };
   }
 
   const fence = `\`\`\`${detected}\n${pasted.trimEnd()}\n\`\`\`\n`;

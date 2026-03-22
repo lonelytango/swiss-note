@@ -80,8 +80,17 @@ export function guessCodeLanguage(raw: string): string {
 
   const tsStrong =
     /\b(interface|type)\s+\w+|\w+\s*:\s*(string|number|boolean|void|any|unknown|never)\b|\bas\s+const\b|\bsatisfies\b|<\s*\w+(\s*,\s*\w+)*\s*>/;
-  const hasJs = /\b(const|let|var|function|class|import|export|async|await|=>)\b/.test(h);
-  if (hasJs || /[;{}]\s*(\/\/|$)/m.test(h)) {
+  /** Avoid matching English prose ("Let's", "a class", "the function of"). */
+  const looksLikeJsTs =
+    /\b(import|export)\s+/.test(h) ||
+    /\b(const|var)\s+\w+\s*=/.test(h) ||
+    /\blet\s+\w+\s*=/.test(h) ||
+    /\bclass\s+[A-Za-z_$][\w$]*\s*(\{|extends|implements|<)/.test(h) ||
+    /\bfunction\s*[\w$]*\s*\(/.test(h) ||
+    /\)\s*=>|\s*=>\s*\{/.test(h) ||
+    /\basync\s+function\b/.test(h) ||
+    /\bawait\s+/.test(h);
+  if (looksLikeJsTs) {
     if (
       tsStrong.test(h) ||
       /\b(import|export)\s+type\s+/.test(h) ||
