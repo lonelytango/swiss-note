@@ -87,7 +87,7 @@ export function AuthScreen() {
       ) : null}
 
       <Pressable
-        className="mb-3 flex-row items-center justify-center gap-2 rounded-lg bg-neutral-900 py-3.5 active:opacity-80 dark:bg-neutral-100"
+        className="mb-3 flex-row items-center justify-center gap-2 rounded-lg bg-neutral-900 py-3.5 transition-colors duration-150 hover:bg-neutral-800 active:opacity-90 disabled:opacity-50 dark:bg-neutral-100 dark:hover:bg-neutral-200 dark:active:opacity-90 dark:disabled:opacity-50"
         onPress={onSignIn}
         disabled={busy}
       >
@@ -102,7 +102,7 @@ export function AuthScreen() {
       </Pressable>
 
       <Pressable
-        className="flex-row items-center justify-center gap-2 rounded-lg border border-neutral-300 py-3.5 active:bg-neutral-100 dark:border-neutral-600 dark:active:bg-neutral-800"
+        className="flex-row items-center justify-center gap-2 rounded-lg border border-neutral-300 py-3.5 hover:border-neutral-400 hover:bg-neutral-100 active:bg-neutral-200 disabled:opacity-50 dark:border-neutral-600 dark:hover:border-neutral-500 dark:hover:bg-neutral-800 dark:active:bg-neutral-700 dark:disabled:opacity-50"
         onPress={onSignUp}
         disabled={busy}
       >

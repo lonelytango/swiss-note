@@ -31,7 +31,7 @@ export function UnsavedChangesModal({
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onKeepEditing}>
       <Pressable
-        className="flex-1 items-center justify-center bg-black/50 px-6"
+        className="flex-1 items-center justify-center bg-black/50 px-6 hover:bg-black/55 active:bg-black/60"
         onPress={onKeepEditing}
         accessibilityRole="button"
         accessibilityLabel="Dismiss dialog"
@@ -49,7 +49,7 @@ export function UnsavedChangesModal({
           </View>
           <View className="mt-5 flex-col gap-2">
             <Pressable
-              className="flex-row items-center justify-center gap-2 rounded-xl bg-neutral-900 py-3.5 active:opacity-85 dark:bg-neutral-100"
+              className="flex-row items-center justify-center gap-2 rounded-xl bg-neutral-900 py-3.5 transition-colors duration-150 hover:bg-neutral-800 active:opacity-90 disabled:opacity-50 dark:bg-neutral-100 dark:hover:bg-neutral-200 dark:active:opacity-90 dark:disabled:opacity-50"
               onPress={onSave}
               disabled={saving}
             >
@@ -63,7 +63,7 @@ export function UnsavedChangesModal({
               )}
             </Pressable>
             <Pressable
-              className="flex-row items-center justify-center gap-2 rounded-xl border border-red-200 bg-red-50 py-3.5 active:opacity-80 dark:border-red-900 dark:bg-red-950"
+              className="flex-row items-center justify-center gap-2 rounded-xl border border-red-200 bg-red-50 py-3.5 hover:border-red-300 hover:bg-red-100 active:opacity-90 disabled:opacity-50 dark:border-red-900 dark:bg-red-950 dark:hover:border-red-800 dark:hover:bg-red-900/80 dark:disabled:opacity-50"
               onPress={onDiscard}
               disabled={saving}
             >
@@ -71,7 +71,7 @@ export function UnsavedChangesModal({
               <Text className="font-semibold text-red-800 dark:text-red-200">Discard changes</Text>
             </Pressable>
             <Pressable
-              className="flex-row items-center justify-center gap-2 rounded-xl border border-neutral-200 py-3.5 active:bg-neutral-50 dark:border-neutral-600 dark:active:bg-neutral-800"
+              className="flex-row items-center justify-center gap-2 rounded-xl border border-neutral-200 py-3.5 hover:border-neutral-300 hover:bg-neutral-50 active:bg-neutral-100 disabled:opacity-50 dark:border-neutral-600 dark:hover:border-neutral-500 dark:hover:bg-neutral-800 dark:active:bg-neutral-700 dark:disabled:opacity-50"
               onPress={onKeepEditing}
               disabled={saving}
             >
